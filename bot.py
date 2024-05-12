@@ -255,38 +255,51 @@ class Jenni(irc.Bot):
         return CommandInput(text, origin, bytes, match, event, args)
 
     def call(self, func, origin, jenni, input):
-        nick = (input.nick).lower()
+    nick = input.nick.lower()
+    
+    # Rate limiting check
+    if not self.is_rate_limited(nick, func, input):
+        return
+    
+    # Exclusion checks
+    if self.is_excluded(input.sender.lower(), func):
+        return
+    
+    # Execute the function and handle any errors
+    self.execute_function(func, jenni, input)
 
-        ## rate limiting
+    def is_rate_limited(self, nick, func, input):
         if nick in self.times:
             if func in self.times[nick]:
-                if not input.admin:
-                    ## admins are not rate limited
+                if not input.admin:  # admins are not rate limited
                     if time.time() - self.times[nick][func] < func.rate:
                         self.times[nick][func] = time.time()
-                        return
+                        return False
         else:
             self.times[nick] = dict()
-
+        
         self.times[nick][func] = time.time()
+        return True
 
+    def is_excluded(self, sender, func):
         try:
             if hasattr(self, 'excludes'):
-                if (input.sender).lower() in self.excludes:
-                    if '!' in self.excludes[(input.sender).lower()]:
-                        # block all function calls for this channel
-                        return
+                if sender in self.excludes:
+                    exclusions = self.excludes[sender]
+                    if '!' in exclusions:
+                        return True  # block all function calls for this channel
                     fname = func.func_code.co_filename.split('/')[-1].split('.')[0]
-                    if fname in self.excludes[(input.sender).lower()]:
-                        # block function call if channel is blacklisted
-                        return
-        except Exception, e:
-            print "Error attempting to block:", str(func.name)
+                    if fname in exclusions:
+                        return True  # block function call if channel is blacklisted
+        except Exception as e:
+            print(f"Error attempting to block: {func.name}, Error: {str(e)}")
             self.error(origin)
+        return False
 
+    def execute_function(self, func, jenni, input):
         try:
             func(jenni, input)
-        except Exception, e:
+        except Exception as e:
             self.error(origin)
 
     def limit(self, origin, func):
@@ -297,90 +310,70 @@ class Jenni(irc.Bot):
                     return True
         return False
 
+
     def dispatch(self, origin, args):
-        bytes, event, args = args[0], args[1], args[2:]
-        text = decode(bytes)
+    bytes, event, args = args[0], args[1], args[2:]
+    text = decode(bytes)
 
-        for priority in ('high', 'medium', 'low'):
-            items = self.commands[priority].items()
-            for regexp, funcs in items:
-                for func in funcs:
-                    if event != func.event: continue
+    for priority in ('high', 'medium', 'low'):
+        items = self.commands[priority].items()
+        for regexp, funcs in items:
+            for func in funcs:
+                if event != func.event: continue
 
-                    match = regexp.match(text)
-                    if match:
-                        if self.limit(origin, func): continue
+                if regexp.match(text):
+                    if self.limit(origin, func): continue
 
-                        jenni = self.wrapped(origin, text, match)
-                        input = self.input(origin, text, bytes, match, event, args)
+                    if self.is_blocked(origin, func):
+                        return
 
-                        nick = (input.nick).lower()
+                    self.execute_command(func, origin, text, bytes, match, event, args)
 
-                        # blocking ability
-                        if os.path.isfile("blocks"):
-                            g = open("blocks", "r")
-                            contents = g.readlines()
-                            g.close()
+    def is_blocked(self, origin, func):
+        blocked = self.load_blocked_items()
+        if any(self.check_block(item, getattr(origin, attr)) for attr, item in blocked.items()):
+            return True
+        return False
 
-                            try: bad_masks = contents[0].split(',')
-                            except: bad_masks = ['']
+    def load_blocked_items(self):
+        with open("blocks", "r") as g:
+            contents = g.readlines()
+        return {
+            "masks": [line.strip() for line in contents[0].split(',') if line.strip()],
+            "nicks": [line.strip() for line in contents[1].split(',') if line.strip()],
+            "idents": [line.strip() for line in contents[2].split(',') if line.strip()]
+        }
 
-                            try: bad_nicks = contents[1].split(',')
-                            except: bad_nicks = ['']
+    def check_block(self, block_items, origin_attribute):
+        for item in block_items:
+            try:
+                if re.compile(item).findall(origin_attribute):
+                    return True
+            except re.error:
+                if item in origin_attribute:
+                    return True
+        return False
 
-                            try: bad_idents = contents[2].split(',')
-                            except: bad_idents = ['']
+    def execute_command(self, func, origin, text, bytes, match, event, args):
+        jenni = self.wrapped(origin, text, match)
+        input = self.input(origin, text, bytes, match, event, args)
 
-                            # check for blocked hostmasks
-                            if len(bad_masks) > 0:
-                                host = origin.host
-                                host = host.lower()
-                                for hostmask in bad_masks:
-                                    hostmask = hostmask.replace("\n", "").strip()
-                                    if len(hostmask) < 1: continue
-                                    try:
-                                        re_temp = re.compile(hostmask)
-                                        if re_temp.findall(host):
-                                            return
-                                    except:
-                                        if hostmask in host:
-                                            return
-                            # check for blocked nicks
-                            if len(bad_nicks) > 0:
-                                for nick in bad_nicks:
-                                    nick = nick.replace("\n", "").strip()
-                                    if len(nick) < 1: continue
-                                    try:
-                                        re_temp = re.compile(nick)
-                                        if re_temp.findall(input.nick):
-                                            return
-                                    except:
-                                        if nick in input.nick:
-                                            return
+        # Run command on a new thread if required by the function
+        if func.thread:
+            threading.Thread(target=self.call, args=(func, origin, jenni, input)).start()
+        else:
+            self.call(func, origin, jenni, input)
 
-                            if len(bad_idents) > 0:
-                                for ident in bad_idents:
-                                    ident = ident.replace('\n', '').strip()
-                                    if len(ident) < 1: continue
-                                    try:
-                                        re_temp = re.compile(ident)
-                                        if re_temp.findall(input.ident):
-                                            return
-                                    except:
-                                        if ident in input.ident:
-                                            return
+        self.update_stats(func, origin)
 
-                        # stats
-                        if func.thread:
-                            targs = (func, origin, jenni, input)
-                            t = threading.Thread(target=self.call, args=targs)
-                            t.start()
-                        else: self.call(func, origin, jenni, input)
+    def update_stats(self, func, origin):
+        sources = [origin.sender, origin.nick]
+        for source in sources:
+            if (func.name, source) in self.stats:
+                self.stats[(func.name, source)] += 1
+            else:
+                self.stats[(func.name, source)] = 1
 
-                        for source in [origin.sender, origin.nick]:
-                            try: self.stats[(func.name, source)] += 1
-                            except KeyError:
-                                self.stats[(func.name, source)] = 1
 
 if __name__ == '__main__':
     print __doc__
